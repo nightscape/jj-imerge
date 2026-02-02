@@ -622,12 +622,152 @@ def resolve_loop(grid):
 | Cleanup/finish | `simplify()` with `commit-tree` plumbing | `jj rebase -r` to reparent final result |
 | Dependencies | Python + git | Python (or shell) + jj |
 
-### 9.9 Recommended Path Forward
+### 9.9 The Primary Use Case: Updating a Feature Branch on Main
 
-For a user who just wants pairwise conflict resolution in jj:
+The most common scenario where pairwise conflict resolution is needed is **rebasing a feature branch onto an updated main branch**. When main has moved forward by many commits, a direct rebase can dump a pile of unrelated conflicts on you at once. The fix is to rebase onto each new main commit one at a time, so each step introduces at most one small conflict.
 
-1. **Start with the incremental rebase workflow** (section 9.2) -- requires no tooling at all. This handles 80% of cases where you're rebasing a feature branch onto an updated main.
+**The problem:**
+```
+main:    M0 ─── M1 ─── M2 ─── M3 ─── ... ─── Mn
+          \
+feature:   F1 ─── F2 ─── F3
+```
 
-2. **If that's not sufficient**, build a lightweight script (section 9.6) that constructs the 2D merge grid using `jj new`. This handles the case where both sides have significant changes and you want to decompose conflicts in both dimensions.
+`jj rebase -b feature -d Mn` may produce a complex multi-conflict mess because the cumulative changes in M1..Mn interact with the feature changes in multiple ways.
 
-3. **Only if heavy use demands it**, invest in a full tool with: progress visualization (like git-imerge's `diagram` command), multiple simplification goals, session persistence, and bash completion.
+**The solution: step through main one commit at a time:**
+```
+Step 1:  jj rebase -b feature -d M1   (small or no conflict)
+Step 2:  jj rebase -b feature -d M2   (small or no conflict)
+Step 3:  jj rebase -b feature -d M3   (maybe one small conflict)
+...
+Step n:  jj rebase -b feature -d Mn   (done)
+```
+
+Each step only introduces one main commit's worth of changes, so any conflict involves just that one commit vs your feature -- not the accumulated effect of all main changes at once.
+
+**Why this works well in jj specifically:**
+- `jj rebase` never blocks on conflicts -- it stores them in the commit
+- If a step produces a conflict, you resolve it and jj auto-rebases descendants
+- The next step's rebase starts from a clean resolved state
+- No special tooling is needed for the rebase itself -- jj handles it natively
+
+**A script to automate this:**
+
+```bash
+#!/bin/bash
+# jj-imerge: incrementally rebase a branch onto a destination,
+# stepping through each intermediate commit to keep conflicts small.
+#
+# Usage: jj-imerge <feature-branch> <destination>
+# Example: jj-imerge my-feature main
+
+set -euo pipefail
+
+FEATURE="${1:?Usage: jj-imerge <feature-bookmark> <destination>}"
+DEST="${2:?Usage: jj-imerge <feature-bookmark> <destination>}"
+
+# Find the fork point (merge base)
+FORK=$(jj log -r "heads(::\"$FEATURE\" & ::\"$DEST\")" \
+    -T 'commit_id' --no-graph | head -1)
+
+if [ -z "$FORK" ]; then
+    echo "Error: could not find fork point between $FEATURE and $DEST"
+    exit 1
+fi
+
+echo "Fork point: $(jj log -r "$FORK" -T 'change_id.short()' --no-graph)"
+
+# Get the list of destination commits since the fork, in chronological order
+mapfile -t MAIN_COMMITS < <(
+    jj log -r "$FORK..\"$DEST\"" -T 'change_id ++ "\n"' \
+        --no-graph --reversed
+)
+
+TOTAL=${#MAIN_COMMITS[@]}
+echo "Incrementally rebasing $FEATURE through $TOTAL commits to reach $DEST"
+echo ""
+
+STEP=0
+for commit in "${MAIN_COMMITS[@]}"; do
+    STEP=$((STEP + 1))
+    SHORT=$(jj log -r "$commit" -T 'change_id.short()' --no-graph)
+    DESC=$(jj log -r "$commit" \
+        -T 'description.first_line().truncate(60)' --no-graph)
+    echo "[$STEP/$TOTAL] Rebasing onto $SHORT: $DESC"
+
+    jj rebase -b "$FEATURE" -d "$commit"
+
+    # Check if any feature commits now have conflicts
+    CONFLICTS=$(jj log -r "\"$commit\"..\"$FEATURE\"" \
+        -T 'if(conflict, change_id.short() ++ "\n", "")' --no-graph)
+
+    if [ -n "$CONFLICTS" ]; then
+        echo ""
+        echo "  ⚠ Conflicts detected in:"
+        echo "$CONFLICTS" | while read -r c; do
+            [ -n "$c" ] && echo "    $c"
+        done
+        echo ""
+        echo "  Resolve them (jj new <change>, edit, jj squash),"
+        echo "  then press Enter to continue..."
+        read -r
+    else
+        echo "  ✓ clean"
+    fi
+done
+
+echo ""
+echo "Done! $FEATURE is now rebased onto $DEST."
+echo "All conflicts resolved incrementally."
+```
+
+**How it works in practice:**
+
+```
+$ jj-imerge my-feature main
+Fork point: kxqv
+Incrementally rebasing my-feature through 12 commits to reach main
+
+[1/12] Rebasing onto mpzw: refactor auth module
+  ✓ clean
+[2/12] Rebasing onto rlkn: update API response types
+  ✓ clean
+[3/12] Rebasing onto xqst: rename User.email to User.contact_email
+
+  ⚠ Conflicts detected in:
+    ykvn
+
+  Resolve them (jj new <change>, edit, jj squash),
+  then press Enter to continue...
+
+[4/12] Rebasing onto nwvy: add rate limiting middleware
+  ✓ clean
+...
+[12/12] Rebasing onto ztmk: bump version to 2.4.0
+  ✓ clean
+
+Done! my-feature is now rebased onto main.
+All conflicts resolved incrementally.
+```
+
+In this example, only step 3 produced a conflict -- and it was a small, focused conflict (a field rename that touched the same file as the feature). The user resolved just that one conflict and continued. Without incremental rebasing, all 12 main commits' changes would have been piled together, potentially producing multiple overlapping conflicts.
+
+### 9.10 When You Need More Than 1D
+
+The script above decomposes the destination side (main) into individual commits. This handles the vast majority of real-world "updating a feature branch" scenarios.
+
+You'd only need the full 2D grid approach (section 9.3) when:
+- **Both sides** have many commits that independently conflict with each other
+- The feature branch itself has multiple commits that each conflict differently with different parts of main
+- You want to identify exactly *which feature commit* conflicts with *which main commit*
+
+For most users, the 1D incremental rebase is sufficient. The 2D grid is the generalization for truly complex merge situations.
+
+### 9.11 Recommended Path Forward
+
+1. **Start with the incremental rebase script above** (section 9.9) -- handles the primary use case of updating a feature branch on main. ~50 lines of bash.
+
+2. **If that's not sufficient**, build the 2D grid (section 9.3/9.6) to decompose conflicts in both dimensions. ~150-250 lines.
+
+3. **Only if heavy use demands it**, invest in a full tool with progress visualization, session persistence, and cleanup automation.
