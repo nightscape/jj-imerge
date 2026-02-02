@@ -383,3 +383,251 @@ This estimate is for the hybrid approach (Strategy A). A pure jj port (Strategy 
 4. **jj's conflict model**: `git-imerge`'s algorithm assumes conflicts are binary (succeed/fail). jj's first-class conflicts add nuance that the algorithm doesn't currently exploit.
 5. **User expectations**: jj users may expect different interaction patterns (e.g., not needing `git add`).
 6. **Feature interaction**: How does imerge's temporary workspace thrashing interact with jj's auto-snapshotting? Need to ensure jj doesn't create spurious operations for intermediate states.
+
+---
+
+## 9. Alternative: A jj-Native Approach to Pairwise Conflict Resolution
+
+Rather than porting git-imerge's implementation, jj's design enables a fundamentally simpler approach to the same problem. The core user need is: **"I want to resolve one small conflict at a time, not a pile of unrelated conflicts simultaneously."** jj's first-class conflicts, automatic propagation, and flexible rebase make this achievable with far less machinery than git-imerge requires.
+
+### 9.1 Why git-imerge Is So Complex
+
+git-imerge's 4,366 lines exist largely because of Git's limitations:
+
+1. **Git merges are blocking** -- a conflict stops execution, so the tool must carefully manage the `checkout -f` / `merge` / `abort` / `commit` dance
+2. **Git has no conflict-in-commits** -- intermediate conflicted states can't be saved, so the tool needs a ref-based persistence layer (`refs/imerge/`)
+3. **Git's working tree is shared state** -- the tool must check for clean state, save/restore HEAD, and manage the index
+4. **Optimization is essential** -- because each merge attempt thrashes the working tree, git-imerge uses bisection to minimize the number of merge probes
+
+In jj, **none of these constraints exist**:
+- Merges never block (conflicts are stored in commits)
+- Conflicted commits are normal commits that can be rebased and manipulated
+- `jj new` creates a fresh commit without disrupting anything
+- Conflict resolution in one commit automatically propagates to descendants
+
+### 9.2 The Simplest jj Approach: Incremental Rebase
+
+The simplest way to achieve pairwise conflict resolution in jj requires **no external tool at all**. It's a workflow pattern:
+
+**Scenario:** You want to merge branch A (commits a1, a2, a3) with branch B (commits b1, b2, b3), but a direct merge produces a complex conflict.
+
+**Step 1: Rebase one commit at a time**
+```bash
+# Instead of merging all of A onto tip of B at once:
+#   jj new tip_a tip_b   <-- this produces the big complex conflict
+
+# Rebase just a1 onto b1, then a2 onto that result, etc:
+jj rebase -s a1 -d b1
+# If a1' has conflicts, resolve them (edit files, jj squash)
+# Then continue with a2, a3...
+```
+
+Since jj's rebase never stops, all commits are rebased at once. Some may have conflicts, some may not. The user works through them in order:
+```bash
+jj log                    # see which commits have conflicts
+jj new <first_conflicted> # check it out
+# resolve conflicts by editing files
+jj squash                 # fold resolution back into the commit
+# jj automatically re-rebases descendants -- some conflicts may auto-resolve
+jj log                    # check what's left
+```
+
+**What this gives you:** Each conflict involves only one commit's worth of changes from branch A, making each conflict smaller and more focused than a big-bang merge.
+
+**What this doesn't give you:** It doesn't decompose the *destination* side. If B has 20 commits and a1 conflicts with some combination of them, you still get the full conflict of a1 vs all-of-B in one shot.
+
+### 9.3 The Full 2D Grid Approach in jj
+
+For the full git-imerge-style experience (decomposing *both* sides), a script could build the merge grid using jj's native operations:
+
+```
+Grid structure (same as git-imerge):
+
+      b0    b1    b2    b3
+  a0  base  b1    b2    b3     <- row 0: just branch B commits
+  a1  a1    (1,1) (1,2) (1,3)  <- row 1: a1 merged with each b
+  a2  a2    (2,1) (2,2) (2,3)  <- row 2: a1+a2 merged with each b
+  a3  a3    (3,1) (3,2) (3,3)  <- row 3: all of A merged with each b
+
+Cell (i,j) = merge of cell(i-1,j) and cell(i,j-1)
+             using cell(i-1,j-1) as the base
+```
+
+**In jj, building this grid is straightforward:**
+
+```bash
+# For each cell (i,j) in the grid:
+jj new cell_i-1_j cell_i_j-1    # create merge commit with two parents
+jj describe -m "imerge (i,j)"   # label it
+# Check if @ has conflicts:
+#   jj log -r @ -T 'conflict' --no-graph
+# Record the change ID, move on to the next cell
+```
+
+The critical difference from git-imerge: **every cell can be created regardless of conflicts**. In git, `git merge` fails on conflict and you must abort before trying the next cell. In jj, `jj new parent1 parent2` always succeeds -- it creates a conflicted commit if the merge isn't clean.
+
+This means you can build the **entire grid at once**, then present the user with the conflicted cells in order. When the user resolves one, jj's conflict propagation may auto-resolve others.
+
+### 9.4 Conflict Propagation Changes Everything
+
+This is the key insight that makes a jj-native tool fundamentally different from git-imerge.
+
+**In git-imerge:** Resolving cell (1,1) gives you a commit SHA. Cells (2,1) and (1,2) must be computed separately by doing new merges. The resolution of (1,1) helps indirectly (it's an ancestor of the parents being merged), but the tool must explicitly compute each cell.
+
+**In jj:** If the grid is built as a DAG where cell (i,j) is a child of cell (i-1,j) and cell (i,j-1), then resolving a conflict in cell (i,j) causes jj to **automatically re-rebase all descendant cells**. This means:
+
+1. Build the grid as a DAG of merge commits
+2. Find the smallest conflicted cell (closest to 0,0)
+3. User resolves it
+4. jj propagates the resolution -- descendants are automatically rebased
+5. Check which cells still have conflicts
+6. Repeat from step 2
+
+In the best case, resolving cell (1,1) automatically resolves cells (2,1), (1,2), (2,2), etc., because the same conflict was cascading through the grid. In git-imerge, you'd have to recompute each of those cells explicitly.
+
+### 9.5 What a Minimal jj-imerge Tool Would Look Like
+
+Instead of 4,366 lines of Python managing git plumbing, a jj-native tool needs:
+
+1. **Grid construction** (~50-100 lines): enumerate commits on both branches, create merge commits for each cell using `jj new parent1 parent2`
+2. **Conflict detection** (~20 lines): query each cell for conflicts using `jj log -r <rev> -T 'conflict'`
+3. **User workflow** (~30 lines): point the user at the next conflicted cell, wait for resolution
+4. **Simplification/finish** (~50 lines): once all cells are clean, extract the final result from cell (n,m) and move a bookmark to it
+
+**That's roughly 150-250 lines of shell script or Python**, compared to git-imerge's 4,366 lines. The reduction comes from:
+- No working-tree management (jj handles it)
+- No state persistence layer (commits exist in the DAG; use change IDs to track them)
+- No conflict detection retry loop (jj merges never fail)
+- No bisection algorithm needed (you can build the full grid cheaply since each cell is just `jj new`)
+- No `automerge` / `manualmerge` distinction (all cells are created the same way)
+
+### 9.6 Sketch of the Algorithm
+
+```python
+#!/usr/bin/env python3
+"""jj-imerge: incremental merge for jujutsu"""
+
+import subprocess, json, sys
+
+def jj(*args):
+    """Run a jj command and return stdout."""
+    return subprocess.check_output(
+        ['jj', '--color=never'] + list(args)
+    ).decode().strip()
+
+def jj_log(revset, template):
+    """Query jj log with a template, return lines."""
+    out = jj('log', '-r', revset, '-T', template, '--no-graph')
+    return [l for l in out.splitlines() if l]
+
+def has_conflict(rev):
+    """Check if a revision has conflicts."""
+    result = jj_log(rev, 'if(conflict, "true", "false")')
+    return result and result[0] == "true"
+
+def get_commit_id(rev):
+    """Get the commit ID of a revision."""
+    return jj_log(rev, 'commit_id')[0]
+
+def build_grid(base, tip1, tip2):
+    """Build the incremental merge grid.
+
+    Returns a 2D array of change IDs, where grid[i][j] is the
+    merge of commits 0..i from branch1 with commits 0..j from branch2.
+    """
+    # Get commit lists
+    commits1 = jj_log(f'{base}..{tip1}', 'commit_id ++ "\\n"')
+    commits2 = jj_log(f'{base}..{tip2}', 'commit_id ++ "\\n"')
+
+    n, m = len(commits1), len(commits2)
+    grid = [[None]*(m+1) for _ in range(n+1)]
+
+    # Row 0 = base, b1, b2, ...
+    grid[0][0] = get_commit_id(base)
+    for j in range(1, m+1):
+        grid[0][j] = commits2[j-1]
+
+    # Column 0 = base, a1, a2, ...
+    for i in range(1, n+1):
+        grid[i][0] = commits1[i-1]
+
+    # Fill the grid
+    for i in range(1, n+1):
+        for j in range(1, m+1):
+            parent1 = grid[i][j-1]   # left neighbor
+            parent2 = grid[i-1][j]   # top neighbor
+            jj('new', parent1, parent2, '-m',
+               f'imerge ({i},{j})')
+            grid[i][j] = get_commit_id('@')
+
+    return grid
+
+def find_conflicts(grid):
+    """Return list of (i, j) cells that have conflicts, sorted by i+j."""
+    conflicts = []
+    for i in range(1, len(grid)):
+        for j in range(1, len(grid[0])):
+            if has_conflict(grid[i][j]):
+                conflicts.append((i, j))
+    conflicts.sort(key=lambda x: x[0] + x[1])
+    return conflicts
+
+def resolve_loop(grid):
+    """Present conflicted cells to user one at a time."""
+    while True:
+        conflicts = find_conflicts(grid)
+        if not conflicts:
+            print("All conflicts resolved!")
+            return grid[-1][-1]  # final merge result
+
+        i, j = conflicts[0]
+        print(f"Conflict at ({i},{j}) -- {len(conflicts)} remaining")
+        print(f"  This merges commit {i} from branch1")
+        print(f"  with commit {j} from branch2")
+
+        # Point user at the conflict
+        jj('new', grid[i][j])
+        print("Resolve the conflict, then run: jj squash")
+        input("Press Enter when resolved...")
+
+        # After resolution, jj auto-rebases descendants
+        # Re-check the grid (change IDs are stable across rebases)
+```
+
+### 9.7 Important Caveats
+
+**Grid construction modifies the DAG.** Building the full grid creates n*m merge commits. For large branches (e.g., 50 x 50 = 2,500 commits), this could be slow and cluttered. Mitigations:
+- Only build the grid incrementally (row by row or along the diagonal)
+- Use a separate jj workspace (`jj workspace add`) to isolate imerge commits
+- Clean up intermediate commits after finishing
+
+**Change IDs vs commit IDs.** The sketch above uses commit IDs, but change IDs would be more robust since they survive rewrites. When jj propagates a conflict resolution, the commit ID of descendant cells changes, but their change IDs stay the same.
+
+**Conflict propagation is not guaranteed to cascade.** If cell (1,1) has a conflict because a1 modifies file X and b1 also modifies file X, resolving (1,1) helps descendant cells *that inherit the same conflict*. But cell (2,1) might have a *different* conflict (a2 modifies file Y which b1 also touches), which won't be resolved by fixing (1,1). The user would still need to resolve each unique conflict, but they won't see the *same* conflict repeated across multiple cells.
+
+**The simplification step still matters.** After all conflicts are resolved, the grid contains many intermediate merge commits that shouldn't appear in the final history. You'd still need to extract the final result -- either by using cell (n,m) directly as a merge commit, or by using `jj rebase` to produce a clean rebase/merge result. This is simpler in jj than in git because `jj rebase -r` can reparent individual commits without low-level plumbing.
+
+### 9.8 Comparison: git-imerge vs jj-native Approach
+
+| Aspect | git-imerge | jj-native approach |
+|--------|-----------|-------------------|
+| Lines of code | 4,366 | ~150-250 |
+| Grid construction | Merge + check exit code + abort on failure | `jj new p1 p2` (always succeeds) |
+| Conflict detection | Exit code of `git merge` | Template query on commit |
+| State persistence | `refs/imerge/` hierarchy | Commits in the DAG (change IDs) |
+| Working tree management | `checkout -f`, `reset --hard`, index manipulation | Not needed |
+| Bisection optimization | Yes (avoids unnecessary merges) | Optional (building all cells is cheap) |
+| Conflict resolution propagation | Manual (recompute each cell) | Automatic (jj rebases descendants) |
+| User workflow | `git add` + `git-imerge continue` | Edit files + `jj squash` |
+| Cleanup/finish | `simplify()` with `commit-tree` plumbing | `jj rebase -r` to reparent final result |
+| Dependencies | Python + git | Python (or shell) + jj |
+
+### 9.9 Recommended Path Forward
+
+For a user who just wants pairwise conflict resolution in jj:
+
+1. **Start with the incremental rebase workflow** (section 9.2) -- requires no tooling at all. This handles 80% of cases where you're rebasing a feature branch onto an updated main.
+
+2. **If that's not sufficient**, build a lightweight script (section 9.6) that constructs the 2D merge grid using `jj new`. This handles the case where both sides have significant changes and you want to decompose conflicts in both dimensions.
+
+3. **Only if heavy use demands it**, invest in a full tool with: progress visualization (like git-imerge's `diagram` command), multiple simplification goals, session persistence, and bash completion.
